@@ -1,0 +1,352 @@
+#!/bin/bash
+# cmuxman — cmux fleet manager.
+# Safe app updates with session preservation, fleet status, duplicate cleanup,
+# and meta-orchestration of Claude sessions (send/tail/spawn/council).
+set -u
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+BIN_DIR="$(cd "$(dirname "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")" && pwd)"
+VERSION=0.1.0
+REPO="${CMUX_REPO:-manaflow-ai/cmux}"
+APP="${CMUX_APP:-/Applications/cmux.app}"
+VAULT="${CMUX_VAULT:-$HOME/projects/cmux-vault}"
+WORKER="$BIN_DIR/cmuxman-update-worker"
+LABEL=com.cmux.manager.update
+
+usage() {
+  cat <<'EOF'
+cmuxman — cmux fleet manager
+
+Fleet:
+  status                     table of workspaces: id, BUSY/IDLE state, title
+  tail <ws> [n]              last n lines (default 40) of workspace <ws>
+  send <ws> <text> [--force] type text+Enter into a workspace (busy-guarded)
+  spawn --cwd D --command C  new workspace (socket, AppleScript fallback)
+  dedupe [--apply]           find duplicate-title workspaces; --apply closes idle twins
+  council <question> [-e a,b,c]  fan question out to engine pool, print all answers
+
+Limit auto-resume & remote:
+  limit-scan                 show sessions blocked/near the 5h usage limit
+  resume-fleet [--now|--at HH:MM]  schedule (or run) auto-continue of
+                             limit-blocked sessions after the limit resets
+  remote-install             set up phone remote control via ntfy.sh topic
+  remote-serve               run the remote command listener (foreground)
+
+Update & recovery:
+  update [--force]           check release, download+verify dmg, update app,
+                             restore all sessions, verify, notify
+  verify                     session counts + missing-vs-manifest + dupe check
+  restore-missing            targeted re-spawn of manifest sessions not running
+  rescue [...]               tier-0 failsafe restore from ~/.claude/projects
+  snapshot [name]            save named snapshot copy to vault (+git commit)
+  doctor                     environment health checks
+EOF
+}
+
+busy() {  # workspace actively running a turn?
+  CMUX_QUIET=1 cmux read-screen --workspace "$1" --lines 15 2>/dev/null | grep -qi 'esc to interrupt'
+}
+ref() { case "$1" in workspace:*) echo "$1";; *) echo "workspace:$1";; esac; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+
+status)
+  python3 - <<'PY'
+import subprocess, os, re, time
+env={**os.environ,'CMUX_QUIET':'1'}
+lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
+rows=re.findall(r'(\*?)\s*workspace:(\d+)\s+(.*)',lst)
+for sel,wid,title in rows:
+    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','15'],
+                     capture_output=True,text=True,env=env,timeout=15)
+    t=r.stdout.lower()
+    if r.returncode!=0: state='ERR  '
+    elif 'esc to interrupt' in t: state='BUSY '
+    elif '⏵' in r.stdout or '❯' in r.stdout or 'shift+tab' in t: state='IDLE '
+    elif r.stdout.strip(): state='SHELL'
+    else: state='EMPTY'
+    mark='*' if sel else ' '
+    print(f"{mark}ws:{wid:>3} {state} {title.strip()[:70]}")
+    time.sleep(0.1)
+PY
+  ;;
+
+tail)
+  [ $# -ge 1 ] || { echo "usage: cmuxman tail <ws> [lines]"; exit 1; }
+  CMUX_QUIET=1 cmux read-screen --workspace "$(ref "$1")" --lines "${2:-40}"
+  ;;
+
+send)
+  [ $# -ge 2 ] || { echo "usage: cmuxman send <ws> <text> [--force]"; exit 1; }
+  WS="$(ref "$1")"; TEXT="$2"; FORCE="${3:-}"
+  if [ "$FORCE" != "--force" ]; then
+    if busy "$WS"; then echo "REFUSED: $WS is mid-turn (use --force to interrupt its input)"; exit 2; fi
+    SCREEN=$(CMUX_QUIET=1 cmux read-screen --workspace "$WS" --lines 10 2>/dev/null)
+    [ -z "$SCREEN" ] && { echo "REFUSED: $WS screen empty (booting shell queues input — retry when ready or --force)"; exit 2; }
+  fi
+  CMUX_QUIET=1 cmux send --workspace "$WS" -- "$TEXT\r" && echo "sent to $WS"
+  ;;
+
+spawn)  exec "$BIN_DIR/cmux-spawn" "$@" ;;
+rescue) exec "$BIN_DIR/cmux-rescue" "$@" ;;
+
+dedupe)
+  APPLY="${1:-}"
+  python3 - "$APPLY" <<'PY'
+import subprocess, os, re, sys, time
+apply = len(sys.argv)>1 and sys.argv[1]=='--apply'
+env={**os.environ,'CMUX_QUIET':'1'}
+lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
+rows=re.findall(r'(\*?)\s*workspace:(\d+)\s+(.*)',lst)
+def norm(t): return re.sub(r'[^\w\s·…-]','',t).strip()
+def busy(wid):
+    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','15'],
+                     capture_output=True,text=True,env=env,timeout=15)
+    return 'esc to interrupt' in r.stdout.lower()
+groups={}
+for sel,wid,title in rows:
+    groups.setdefault(norm(title),[]).append((sel=='*',int(wid)))
+plan=[]
+me=os.environ.get('CMUX_WORKSPACE_ID','')
+for title,members in groups.items():
+    if len(members)<2: continue
+    # keep priority: selected > busy > lowest id; close the rest if idle
+    keep=None
+    for sel,wid in members:
+        if sel: keep=wid; break
+    if keep is None:
+        busies=[wid for _,wid in members if busy(wid)]
+        keep=busies[0] if busies else min(w for _,w in members)
+    for sel,wid in members:
+        if wid!=keep: plan.append((wid,title))
+if not plan:
+    print("no duplicate-title workspaces"); sys.exit(0)
+for wid,title in plan:
+    if apply:
+        if busy(wid): print(f"ws:{wid} SKIP (busy) — {title[:50]}"); continue
+        r=subprocess.run(['cmux','workspace','close',f'workspace:{wid}'],capture_output=True,text=True,env=env)
+        print(f"ws:{wid} {'closed' if r.returncode==0 else 'ERR: '+r.stderr.strip()[:40]} — {title[:50]}")
+        time.sleep(0.3)
+    else:
+        print(f"would close ws:{wid} — {title[:50]}")
+if not apply: print("\nrun `cmuxman dedupe --apply` to close these")
+PY
+  ;;
+
+council)
+  [ $# -ge 1 ] || { echo "usage: cmuxman council <question> [-e engine1,engine2,...]"; exit 1; }
+  command -v ca >/dev/null || { echo "needs `ca` (callagent) on PATH"; exit 1; }
+  Q="$1"; shift || true
+  ENGINES="codex,gemini,kimi"
+  [ "${1:-}" = "-e" ] && ENGINES="$2"
+  STAMP=$$
+  IFS=',' read -ra ENG <<<"$ENGINES"
+  for e in "${ENG[@]}"; do
+    ca spawn --name "council-$STAMP-$e" --prompt "$Q" -e "$e" >/dev/null 2>&1 \
+      && echo "spawned: $e" || echo "spawn failed: $e"
+  done
+  for e in "${ENG[@]}"; do
+    echo; echo "══ $e ══"
+    ca collect --name "council-$STAMP-$e" --wait 240 2>/dev/null || echo "(no answer)"
+  done
+  ;;
+
+snapshot)
+  SNAP=$(ls -t "$HOME/.cmux-snapshots/"auto-*.json 2>/dev/null | head -1)
+  [ -n "$SNAP" ] || { echo "no auto-snapshots in ~/.cmux-snapshots (snapshot daemon down?)"; exit 1; }
+  NAME="${1:-manual-$(date +%Y%m%d-%H%M)}"
+  mkdir -p "$VAULT/snapshots"
+  DEST="$VAULT/snapshots/$NAME.json"
+  cp "$SNAP" "$DEST" && echo "saved: $DEST"
+  git -C "$VAULT" add snapshots >/dev/null 2>&1 && git -C "$VAULT" commit -qm "snapshot: $NAME" >/dev/null 2>&1 || true
+  ;;
+
+verify)          exec "$WORKER" --verify-only ;;
+restore-missing) exec "$WORKER" --restore-missing ;;
+
+update)
+  LATEST=$(gh release view -R "$REPO" --json tagName -q .tagName)
+  CUR=$(defaults read "$APP/Contents/Info.plist" CFBundleShortVersionString)
+  if [ "v$CUR" = "$LATEST" ] && [ "${1:-}" != "--force" ]; then
+    echo "cmux $CUR is already latest ($LATEST) — nothing to do (--force to reinstall)"
+    exit 0
+  fi
+  echo "update: v$CUR -> $LATEST"
+  gh release download "$LATEST" -R "$REPO" -p cmux-macos.dmg -O /tmp/cmux-macos.dmg --clobber
+  hdiutil detach /tmp/cmux-dmg -quiet 2>/dev/null || true
+  hdiutil attach -nobrowse -readonly -mountpoint /tmp/cmux-dmg /tmp/cmux-macos.dmg >/dev/null
+  NEWV=$(defaults read /tmp/cmux-dmg/cmux.app/Contents/Info.plist CFBundleShortVersionString)
+  codesign --verify --deep --strict /tmp/cmux-dmg/cmux.app
+  hdiutil detach /tmp/cmux-dmg -quiet
+  echo "dmg verified: v$NEWV, codesign OK"
+  "$0" snapshot "pre-update-v$NEWV-$(date +%Y%m%d-%H%M)" || true
+  launchctl remove "$LABEL" 2>/dev/null || true
+  launchctl submit -l "$LABEL" -- /bin/bash "$WORKER"
+  echo "submitted — cmux quits in ~20s, update installs, sessions auto-restore."
+  echo "log: tail -f /tmp/cmuxman-update.log"
+  ;;
+
+limit-scan)
+  python3 - <<'PY'
+import subprocess, os, re
+env={**os.environ,'CMUX_QUIET':'1'}
+lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
+found=0
+for wid in re.findall(r'workspace:(\d+)',lst):
+    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','40'],
+                     capture_output=True,text=True,env=env,timeout=15)
+    t=r.stdout
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    hud=re.search(r'Usage\s+\S+\s+(9[5-9]|100)%.*?resets in\s+([\dhm ]+)',t)
+    if hard: print(f"ws:{wid} BLOCKED  {hard.group(0)[:60]}"); found+=1
+    elif hud: print(f"ws:{wid} NEAR-LIMIT {hud.group(1)}% (resets in {hud.group(2).strip()})"); found+=1
+if not found: print("no limit-blocked or near-limit sessions")
+PY
+  ;;
+
+resume-fleet)
+  MODE="${1:-}"
+  LIST=/tmp/cmuxman-resume-list.txt
+  RLOG=/tmp/cmuxman-resume.log
+  PROMPT="${CMUXMAN_RESUME_PROMPT:-continue}"
+  if [ "$MODE" = "--now" ]; then
+    exec >>"$RLOG" 2>&1
+    echo "== $(date '+%F %T') resume-fleet firing"
+    TARGETS=$(cat "$LIST" 2>/dev/null || true)
+    python3 - "$PROMPT" <<'PY'
+import subprocess, os, re, sys, time
+prompt=sys.argv[1]
+env={**os.environ,'CMUX_QUIET':'1'}
+saved=set(open('/tmp/cmuxman-resume-list.txt').read().split()) if os.path.exists('/tmp/cmuxman-resume-list.txt') else set()
+lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
+live=re.findall(r'workspace:(\d+)',lst)
+for wid in live:
+    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','40'],
+                     capture_output=True,text=True,env=env,timeout=15)
+    t=r.stdout
+    if 'esc to interrupt' in t.lower():
+        print(f"ws:{wid} skip (busy)"); continue
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    idle='⏵' in t or '❯' in t or 'shift+tab' in t.lower()
+    if hard or (wid in saved and idle):
+        s=subprocess.run(['cmux','send','--workspace',f'workspace:{wid}','--',prompt+'\\r'],
+                         capture_output=True,text=True,env=env)
+        print(f"ws:{wid} {'nudged' if s.returncode==0 else 'send ERR'}")
+        time.sleep(1.0)
+    else:
+        print(f"ws:{wid} skip (no limit marker, not in saved list)")
+PY
+    osascript -e 'display notification "limit-blocked sessions nudged" with title "cmuxman resume-fleet"' 2>/dev/null || true
+    exit 0
+  fi
+  # schedule mode: record blocked/near-limit ws + compute fire delay from HUD
+  SCAN=$(python3 - "$MODE" "${2:-}" <<'PY'
+import subprocess, os, re, sys
+env={**os.environ,'CMUX_QUIET':'1'}
+me=os.environ.get('CMUX_WORKSPACE_ID','')
+mode=sys.argv[1] if len(sys.argv)>1 else ''
+lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
+targets=[]; max_min=0
+for wid in re.findall(r'workspace:(\d+)',lst):
+    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','40'],
+                     capture_output=True,text=True,env=env,timeout=15)
+    t=r.stdout
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    hud=re.search(r'Usage\s+\S+\s+(9[5-9]|100)%.*?resets in\s+(?:(\d+)h\s*)?(\d+)m',t)
+    if hard or hud:
+        targets.append(wid)
+        if hud:
+            mins=(int(hud.group(2) or 0))*60+int(hud.group(3))
+            max_min=max(max_min,mins)
+with open('/tmp/cmuxman-resume-list.txt','w') as f: f.write('\n'.join(targets)+'\n')
+delay=(max_min+3)*60 if max_min else 35*60
+if mode=='--at' and len(sys.argv)>2:
+    import datetime
+    h,m=map(int,sys.argv[2].split(':'))
+    now=datetime.datetime.now()
+    tgt=now.replace(hour=h,minute=m,second=0)
+    if tgt<now: tgt+=datetime.timedelta(days=1)
+    delay=int((tgt-now).total_seconds())
+print(f"targets: {' '.join(targets) or 'none'}")
+print(f"DELAY={delay}")
+PY
+  )
+  echo "$SCAN" | grep -v '^DELAY='
+  DELAY=$(echo "$SCAN" | grep -oE 'DELAY=[0-9]+' | cut -d= -f2)
+  [ -s /tmp/cmuxman-resume-list.txt ] && [ "$(head -c1 /tmp/cmuxman-resume-list.txt)" != "" ] || { echo "nothing to schedule"; exit 0; }
+  launchctl remove com.cmux.manager.resume 2>/dev/null || true
+  launchctl submit -l com.cmux.manager.resume -- /bin/bash -c "sleep $DELAY; exec \"$BIN_DIR/cmuxman\" resume-fleet --now"
+  FIRE=$(date -v "+${DELAY}S" '+%H:%M' 2>/dev/null || date '+%H:%M')
+  echo "scheduled: resume-fleet fires ~$FIRE (in $((DELAY/60))m, launchd-owned, survives everything except reboot)"
+  ;;
+
+remote-install)
+  CFG="$HOME/.config/cmuxman"; mkdir -p "$CFG"
+  TOPIC_FILE="$CFG/remote-topic"
+  [ -s "$TOPIC_FILE" ] || echo "cmuxman-$(openssl rand -hex 6)" >"$TOPIC_FILE"
+  TOPIC=$(cat "$TOPIC_FILE")
+  PLIST="$HOME/Library/LaunchAgents/com.cmux.manager.remote.plist"
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cmux.manager.remote</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$BIN_DIR/cmuxman</string><string>remote-serve</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/cmuxman-remote.log</string>
+  <key>StandardErrorPath</key><string>/tmp/cmuxman-remote.log</string>
+</dict></plist>
+EOF
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+  echo "remote control active."
+  echo "  phone: install ntfy app, subscribe topic:  $TOPIC"
+  echo "  send commands as messages: status | limit-scan | resume-fleet --now | dedupe | send 15 weiter"
+  echo "  replies arrive on topic:   $TOPIC-r"
+  ;;
+
+remote-serve)
+  TOPIC=$(cat "$HOME/.config/cmuxman/remote-topic" 2>/dev/null) || { echo "run cmuxman remote-install first"; exit 1; }
+  ALLOW="status verify dedupe resume-fleet limit-scan tail send doctor snapshot version"
+  SINCE=$(date +%s)
+  echo "remote-serve listening on ntfy.sh/$TOPIC"
+  while true; do
+    MSGS=$(curl -s --max-time 25 "https://ntfy.sh/$TOPIC/json?poll=1&since=$SINCE" 2>/dev/null)
+    SINCE=$(date +%s)
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      MSG=$(echo "$line" | jq -r 'select(.event=="message") | .message' 2>/dev/null)
+      [ -z "$MSG" ] || [ "$MSG" = null ] && continue
+      set -- $MSG
+      CMD="$1"
+      if echo " $ALLOW " | grep -q " $CMD "; then
+        echo "$(date '+%T') exec: $MSG"
+        OUT=$("$BIN_DIR/cmuxman" "$@" 2>&1 | head -40)
+      else
+        OUT="refused: '$CMD' not in allowlist ($ALLOW)"
+      fi
+      curl -s -d "$OUT" "https://ntfy.sh/$TOPIC-r" >/dev/null 2>&1
+    done <<<"$MSGS"
+    sleep 15
+  done
+  ;;
+
+doctor)
+  ok() { printf '  %-34s %s\n' "$1" "$2"; }
+  ok "cmux binary" "$(command -v cmux || echo MISSING)"
+  ok "socket" "$(cmux ping 2>/dev/null || echo DEAD)"
+  ok "app version" "$(defaults read "$APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo '?')"
+  ok "snapshot daemon" "$(launchctl list 2>/dev/null | grep -q cmux-snapshot && echo loaded || echo NOT LOADED)"
+  ok "auto-snapshots" "$(ls "$HOME/.cmux-snapshots/"auto-*.json 2>/dev/null | wc -l | tr -d ' ') files"
+  ok "gh auth" "$(gh auth status >/dev/null 2>&1 && echo ok || echo MISSING)"
+  ok "worker" "$([ -x "$WORKER" ] && echo ok || echo MISSING)"
+  ok "cmux-spawn (fallback)" "$([ -x "$BIN_DIR/cmux-spawn" ] && echo ok || echo MISSING)"
+  ok "ca council pool" "$(command -v ca >/dev/null && echo ok || echo 'not installed (council disabled)')"
+  ;;
+
+version) echo "cmuxman $VERSION" ;;
+help|*)  usage ;;
+esac

@@ -1,0 +1,134 @@
+#!/bin/bash
+# cmuxman-update-worker — launchd-owned one-shot behind `cmuxman update`:
+#   manifest (live sessions NOW) -> quit cmux -> install /tmp/cmux-macos.dmg
+#   (codesign-gated, rollback kept as cmux.app.old) -> relaunch -> wait for
+#   cmux self-restore -> targeted rescue of ONLY missing manifest sessions
+#   -> verify (missing? duplicate titles?) -> macOS notification.
+#
+# Must be launchd-owned (launchctl submit): a cmux child process dies at quit.
+# Modes:
+#   (no arg)          full cycle (called by `cmuxman update` via launchd)
+#   --verify-only     print verify counts against current manifest, no changes
+#   --restore-missing targeted rescue + verify without quit/install
+set -u
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+BIN_DIR="$(cd "$(dirname "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")" && pwd)"
+LOG=/tmp/cmuxman-update.log
+MANIFEST=/tmp/cmuxman-manifest-sids.txt
+DMG=/tmp/cmux-macos.dmg
+MNT=/tmp/cmux-dmg
+APP="${CMUX_APP:-/Applications/cmux.app}"
+SPAWN="$BIN_DIR/cmux-spawn"; command -v cmux-spawn >/dev/null && [ ! -x "$SPAWN" ] && SPAWN=cmux-spawn
+
+VERIFY_ONLY=0; RESTORE_ONLY=0
+[ "${1:-}" = "--verify-only" ] && VERIFY_ONLY=1
+[ "${1:-}" = "--restore-missing" ] && RESTORE_ONLY=1
+[ "$VERIFY_ONLY" = 0 ] && [ "$RESTORE_ONLY" = 0 ] && exec >>"$LOG" 2>&1
+ts() { date '+%F %T'; }
+
+running_sids() {
+  ps -axo command | grep -oE -- '--resume [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+    | awk '{print $2}' | sort -u
+}
+ws_titles() { CMUX_QUIET=1 cmux workspace list 2>/dev/null | grep -oE 'cc · .*' ; }
+ws_count()  { CMUX_QUIET=1 cmux workspace list 2>/dev/null | grep -c workspace ; }
+
+sid_cwd() {  # cwd recorded inside the session jsonl beats path-demunging
+  local f
+  f=$(ls "$HOME/.claude/projects/"*/"$1".jsonl 2>/dev/null | head -1)
+  [ -n "$f" ] && head -c 40000 "$f" | grep -oE '"cwd":"[^"]*"' | head -1 | cut -d'"' -f4
+}
+
+verify_report() {
+  local missing=0 sid dupes
+  if [ -s "$MANIFEST" ]; then
+    while read -r sid; do
+      running_sids | grep -q "$sid" || { echo "$(ts)   MISSING: $sid"; missing=$((missing+1)); }
+    done <"$MANIFEST"
+  fi
+  dupes=$(ws_titles | sort | uniq -d | wc -l | tr -d ' ')
+  echo "$(ts) verify: $(running_sids | wc -l | tr -d ' ') claude running, $(ws_count) workspaces, missing=$missing, dupe-titles=$dupes"
+  osascript -e "display notification \"$(ws_count) workspaces · missing: $missing · dupes: $dupes\" with title \"cmuxman update+restore done\"" 2>/dev/null || true
+  return "$missing"
+}
+
+if [ "$VERIFY_ONLY" = 1 ]; then
+  echo "== verify-only (manifest: $([ -s "$MANIFEST" ] && wc -l <"$MANIFEST" | tr -d ' ' || echo none))"
+  verify_report
+  exit 0
+fi
+
+if [ "$RESTORE_ONLY" = 1 ]; then
+  [ -s "$MANIFEST" ] || { echo "no manifest at $MANIFEST"; exit 1; }
+  echo "== restore-missing mode (manifest: $(wc -l <"$MANIFEST" | tr -d ' ') sids, no quit/install)"
+else
+
+echo "=== $(ts) start (20s grace for requesting session to report)"
+sleep 20
+
+echo "-- manifest: live claude sessions before quit"
+running_sids >"$MANIFEST"
+echo "   $(wc -l <"$MANIFEST" | tr -d ' ') sessions, $(ws_count) workspaces"
+
+echo "-- quit cmux"
+osascript -e 'quit app "cmux"' 2>/dev/null || true
+for i in $(seq 1 30); do pgrep -x cmux >/dev/null || break; sleep 1; done
+pkill -x cmux 2>/dev/null || true
+sleep 2
+
+if [ -f "$DMG" ]; then
+  hdiutil detach "$MNT" -quiet 2>/dev/null || true
+  if hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null; then
+    NEWV=$(defaults read "$MNT/cmux.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
+    if codesign --verify --deep --strict "$MNT/cmux.app" 2>/dev/null; then
+      rm -rf "$APP.old"
+      mv "$APP" "$APP.old"
+      if ditto "$MNT/cmux.app" "$APP"; then
+        xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+        echo "-- installed v$NEWV (rollback: $APP.old)"
+      else
+        echo "-- ditto FAILED, rolling back"
+        rm -rf "$APP"
+        mv "$APP.old" "$APP"
+      fi
+    else
+      echo "-- codesign verify FAILED, keeping installed version"
+    fi
+    hdiutil detach "$MNT" -quiet 2>/dev/null || true
+  else
+    echo "-- dmg mount failed, relaunching existing version"
+  fi
+else
+  echo "-- no dmg at $DMG, plain restart"
+fi
+
+echo "-- relaunch"
+open -a cmux
+for i in $(seq 1 40); do pgrep -x cmux >/dev/null && break; sleep 1; done
+
+WANT=$(wc -l <"$MANIFEST" | tr -d ' ')
+echo "-- wait for cmux self-restore (target: $WANT sessions, max 120s)"
+for i in $(seq 1 24); do
+  HAVE=$(running_sids | wc -l | tr -d ' ')
+  [ "$HAVE" -ge "$WANT" ] && break
+  sleep 5
+done
+echo "   self-restore brought back $(running_sids | wc -l | tr -d ' ')/$WANT"
+
+fi  # end full-cycle phases
+
+echo "-- targeted rescue of missing manifest sessions"
+while read -r sid; do
+  [ -z "$sid" ] && continue
+  running_sids | grep -q "$sid" && continue
+  CWD=$(sid_cwd "$sid"); CWD=${CWD:-$HOME}
+  echo "   + resume $sid (cwd $CWD)"
+  "$SPAWN" --cwd "$CWD" --command "claude --resume $sid" --focus false </dev/null 2>/dev/null \
+    || echo "   ! spawn failed: $sid"
+  sleep 1.5
+done <"$MANIFEST"
+
+sleep 15
+verify_report
+echo "=== $(ts) done"
+launchctl remove com.cmux.manager.update 2>/dev/null || true
