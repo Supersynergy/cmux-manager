@@ -5,7 +5,7 @@
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 BIN_DIR="$(cd "$(dirname "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")" && pwd)"
-VERSION=0.1.0
+VERSION=0.1.1
 REPO="${CMUX_REPO:-manaflow-ai/cmux}"
 APP="${CMUX_APP:-/Applications/cmux.app}"
 VAULT="${CMUX_VAULT:-$HOME/projects/cmux-vault}"
@@ -196,7 +196,8 @@ for wid in re.findall(r'workspace:(\d+)',lst):
     r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','40'],
                      capture_output=True,text=True,env=env,timeout=15)
     t=r.stdout
-    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    tail='\n'.join([l for l in t.splitlines() if l.strip()][-12:])  # stale scrollback is not a block
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',tail,re.I)
     hud=re.search(r'Usage\s+\S+\s+(9[5-9]|100)%.*?resets in\s+([\dhm ]+)',t)
     if hard: print(f"ws:{wid} BLOCKED  {hard.group(0)[:60]}"); found+=1
     elif hud: print(f"ws:{wid} NEAR-LIMIT {hud.group(1)}% (resets in {hud.group(2).strip()})"); found+=1
@@ -226,7 +227,8 @@ for wid in live:
     t=r.stdout
     if 'esc to interrupt' in t.lower():
         print(f"ws:{wid} skip (busy)"); continue
-    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    tail='\n'.join([l for l in t.splitlines() if l.strip()][-12:])
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',tail,re.I)
     idle='⏵' in t or '❯' in t or 'shift+tab' in t.lower()
     if hard or (wid in saved and idle):
         s=subprocess.run(['cmux','send','--workspace',f'workspace:{wid}','--',prompt+'\\r'],
@@ -237,6 +239,7 @@ for wid in live:
         print(f"ws:{wid} skip (no limit marker, not in saved list)")
 PY
     osascript -e 'display notification "limit-blocked sessions nudged" with title "cmuxman resume-fleet"' 2>/dev/null || true
+    launchctl remove com.cmux.manager.resume 2>/dev/null || true
     exit 0
   fi
   # schedule mode: record blocked/near-limit ws + compute fire delay from HUD
@@ -251,7 +254,8 @@ for wid in re.findall(r'workspace:(\d+)',lst):
     r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','40'],
                      capture_output=True,text=True,env=env,timeout=15)
     t=r.stdout
-    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',t,re.I)
+    tail='\n'.join([l for l in t.splitlines() if l.strip()][-12:])
+    hard=re.search(r'usage limit reached|limit will reset|hit your.*limit',tail,re.I)
     hud=re.search(r'Usage\s+\S+\s+(9[5-9]|100)%.*?resets in\s+(?:(\d+)h\s*)?(\d+)m',t)
     if hard or hud:
         targets.append(wid)
@@ -274,10 +278,19 @@ PY
   echo "$SCAN" | grep -v '^DELAY='
   DELAY=$(echo "$SCAN" | grep -oE 'DELAY=[0-9]+' | cut -d= -f2)
   [ -s /tmp/cmuxman-resume-list.txt ] && [ "$(head -c1 /tmp/cmuxman-resume-list.txt)" != "" ] || { echo "nothing to schedule"; exit 0; }
+  # launchd can only act as TIMER here: the cmux socket denies launchd-started
+  # processes, so the fire pokes the in-cmux remote listener via ntfy, which
+  # executes the nudge with socket access. The job removes its own label —
+  # `launchctl submit` restarts exited jobs forever otherwise.
+  TOPIC_FILE="$HOME/.config/cmuxman/remote-topic"
+  [ -s "$TOPIC_FILE" ] || { echo "needs the in-cmux listener: run  cmuxman remote-install  first"; exit 1; }
+  pgrep -f 'cmuxman remote-serve' >/dev/null || echo "WARN: no remote-serve listener running — run cmuxman remote-install"
+  TOPIC=$(cat "$TOPIC_FILE")
   launchctl remove com.cmux.manager.resume 2>/dev/null || true
-  launchctl submit -l com.cmux.manager.resume -- /bin/bash -c "sleep $DELAY; exec \"$BIN_DIR/cmuxman\" resume-fleet --now"
+  launchctl submit -l com.cmux.manager.resume -- /bin/bash -c \
+    "sleep $DELAY; curl -s -d 'resume-fleet --now' https://ntfy.sh/$TOPIC >/dev/null; sleep 5; launchctl remove com.cmux.manager.resume"
   FIRE=$(date -v "+${DELAY}S" '+%H:%M' 2>/dev/null || date '+%H:%M')
-  echo "scheduled: resume-fleet fires ~$FIRE (in $((DELAY/60))m, launchd-owned, survives everything except reboot)"
+  echo "scheduled: resume-fleet fires ~$FIRE (in $((DELAY/60))m via launchd timer -> ntfy -> in-cmux listener)"
   ;;
 
 remote-install)
@@ -285,23 +298,17 @@ remote-install)
   TOPIC_FILE="$CFG/remote-topic"
   [ -s "$TOPIC_FILE" ] || echo "cmuxman-$(openssl rand -hex 6)" >"$TOPIC_FILE"
   TOPIC=$(cat "$TOPIC_FILE")
+  # retire any old launchd-based listener: launchd processes are DENIED by the
+  # cmux socket ("only processes started inside cmux can connect") — the
+  # listener must live in a cmux workspace.
   PLIST="$HOME/Library/LaunchAgents/com.cmux.manager.remote.plist"
-  cat >"$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.cmux.manager.remote</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/bash</string><string>$BIN_DIR/cmuxman</string><string>remote-serve</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/cmuxman-remote.log</string>
-  <key>StandardErrorPath</key><string>/tmp/cmuxman-remote.log</string>
-</dict></plist>
-EOF
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load "$PLIST"
+  launchctl unload "$PLIST" 2>/dev/null || true; rm -f "$PLIST"
+  if pgrep -f 'cmuxman remote-serve' >/dev/null; then
+    echo "listener already running (inside cmux)"
+  else
+    "$BIN_DIR/cmux-spawn" --cwd "$HOME" --command "$BIN_DIR/cmuxman remote-serve" --focus false \
+      && echo "listener spawned inside cmux"
+  fi
   echo "remote control active."
   echo "  phone: install ntfy app, subscribe topic:  $TOPIC"
   echo "  send commands as messages: status | limit-scan | resume-fleet --now | dedupe | send 15 weiter"
@@ -345,6 +352,7 @@ doctor)
   ok "worker" "$([ -x "$WORKER" ] && echo ok || echo MISSING)"
   ok "cmux-spawn (fallback)" "$([ -x "$BIN_DIR/cmux-spawn" ] && echo ok || echo MISSING)"
   ok "ca council pool" "$(command -v ca >/dev/null && echo ok || echo 'not installed (council disabled)')"
+  ok "remote listener (in cmux)" "$(pgrep -f 'cmuxman remote-serve' >/dev/null && echo running || echo 'NOT RUNNING (cmuxman remote-install)')"
   ;;
 
 version) echo "cmuxman $VERSION" ;;

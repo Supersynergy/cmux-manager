@@ -128,6 +128,12 @@ while read -r sid; do
   sleep 1.5
 done <"$MANIFEST"
 
+# respawn the in-cmux remote listener if configured (it died with the quit)
+if [ -s "$HOME/.config/cmuxman/remote-topic" ] && ! pgrep -f 'cmuxman remote-serve' >/dev/null; then
+  "$SPAWN" --cwd "$HOME" --command "$BIN_DIR/cmuxman remote-serve" --focus false </dev/null 2>/dev/null \
+    && echo "-- remote listener respawned" || echo "-- remote listener respawn failed"
+fi
+
 sleep 15
 verify_report
 echo "=== $(ts) done"
