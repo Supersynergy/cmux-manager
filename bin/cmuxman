@@ -5,7 +5,7 @@
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 BIN_DIR="$(cd "$(dirname "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")" && pwd)"
-VERSION=0.1.1
+VERSION=0.2.0
 REPO="${CMUX_REPO:-manaflow-ai/cmux}"
 APP="${CMUX_APP:-/Applications/cmux.app}"
 VAULT="${CMUX_VAULT:-$HOME/projects/cmux-vault}"
@@ -16,18 +16,30 @@ usage() {
   cat <<'EOF'
 cmuxman — cmux fleet manager
 
-Fleet:
-  status                     table of workspaces: id, BUSY/IDLE state, title
+Fleet (status/goals backed by agentmaster when installed):
+  status                     ground-truth table: agentmaster ls (Needs input/
+                             working/ready) or cmux-dot fallback
+  brief [days]               one-shot state-of-everything: real commits +
+                             fleet status + limit-scan (repeatable /checkin)
   tail <ws> [n]              last n lines (default 40) of workspace <ws>
   send <ws> <text> [--force] type text+Enter into a workspace (busy-guarded)
   spawn --cwd D --command C  new workspace (socket, AppleScript fallback)
   dedupe [--apply]           find duplicate-title workspaces; --apply closes idle twins
+  goal <name> <text>         pin a goal (passthrough to agentmaster)
+  goals                      list all pinned goals + progress
+  triage <ws>                evidence + ready metaflow kill/continue prompt for a stale session
   council <question> [-e a,b,c]  fan question out to engine pool, print all answers
 
-Limit auto-resume & remote:
+Limit auto-resume, autonomous optimize & remote:
   limit-scan                 show sessions blocked/near the 5h usage limit
   resume-fleet [--now|--at HH:MM]  schedule (or run) auto-continue of
                              limit-blocked sessions after the limit resets
+  optimize start [every-min] recurring bounded loop: auto-nudges limit-blocked
+                             sessions + auto-closes idle duplicates, rate-capped
+                             + fully logged (see optimize status). Default 20m.
+  optimize stop              kill-switch: stop the loop immediately
+  optimize status            ledger tail + today's action count + backoffs
+  optimize cycle             run one decision cycle now (used by the timer)
   remote-install             set up phone remote control via ntfy.sh topic
   remote-serve               run the remote command listener (foreground)
 
@@ -51,24 +63,61 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
 
 status)
-  python3 - <<'PY'
+  # Ground truth, in priority order:
+  #   1. agentmaster ls --json  — reads real transcript/session state
+  #      ("Needs input"/"working"/"ready"/idle), not a screen-text guess.
+  #   2. cmux's own dot (workspace list) as fallback if agentmaster is absent.
+  # A prior version of this command scanned terminal text itself and both
+  # misread and hid real activity (a green/active workspace showed as generic
+  # IDLE) — never recompute status by guessing when a ground-truth source exists.
+  if command -v agentmaster >/dev/null 2>&1; then
+    python3 - <<'PY'
+import subprocess, json, os
+env={**os.environ,'CMUX_QUIET':'1'}
+r=subprocess.run(['agentmaster','ls','--json'],capture_output=True,text=True,env=env,timeout=20)
+rows=json.loads(r.stdout) if r.returncode==0 and r.stdout.strip() else []
+me=os.environ.get('CMUX_WORKSPACE_ID','')
+for row in rows:
+    ref=row.get('ref','?'); status=row.get('status','?'); glyph=row.get('glyph','?')
+    title=row.get('title','').strip()
+    mark='*' if str(row.get('pid',''))==me else ' '
+    print(f"{mark}{ref:<14} {glyph} {status:<12} {title[:65]}")
+PY
+  else
+    python3 - <<'PY'
 import subprocess, os, re, time
 env={**os.environ,'CMUX_QUIET':'1'}
 lst=subprocess.run(['cmux','workspace','list'],capture_output=True,text=True,env=env).stdout
 rows=re.findall(r'(\*?)\s*workspace:(\d+)\s+(.*)',lst)
+DOT_ACTIVE = {'🟢','🟡','🟠'}
 for sel,wid,title in rows:
-    r=subprocess.run(['cmux','read-screen','--workspace',f'workspace:{wid}','--lines','15'],
-                     capture_output=True,text=True,env=env,timeout=15)
-    t=r.stdout.lower()
-    if r.returncode!=0: state='ERR  '
-    elif 'esc to interrupt' in t: state='BUSY '
-    elif '⏵' in r.stdout or '❯' in r.stdout or 'shift+tab' in t: state='IDLE '
-    elif r.stdout.strip(): state='SHELL'
-    else: state='EMPTY'
+    title=title.strip()
+    m = re.match(r'([🟢🟡🟠⚫🔴⚪])\s*(.*)', title)
+    dot, rest = (m.group(1), m.group(2)) if m else ('—', title)
+    cmux_state = 'ACTIVE' if dot in DOT_ACTIVE else 'idle  '
     mark='*' if sel else ' '
-    print(f"{mark}ws:{wid:>3} {state} {title.strip()[:70]}")
-    time.sleep(0.1)
+    print(f"{mark}ws:{wid:>3} {dot} {cmux_state:<12} {rest[:60]}")
+    time.sleep(0.05)
 PY
+    echo "(no agentmaster on PATH — using weaker cmux-dot fallback; install agentmaster for real status)"
+  fi
+  ;;
+
+brief)
+  # Repeatable version of a manual /checkin: real commits (not mtime-touch) +
+  # agentmaster fleet ground-truth + limit-scan, so "what's the state of
+  # everything" is one command instead of re-deriving it by hand each time.
+  WINDOW="${1:-5}"
+  echo "== recent real work (git commits, not touched-but-unchanged dirs) =="
+  bash "$HOME/.claude/skills/checkin/scripts/recon.sh" "$WINDOW" 2>/dev/null \
+    | awk '/^## ACTIVE/{p=1} /^## MTIME/{p=0} p' | head -80
+  echo; echo "== fleet ground truth (agentmaster) =="
+  "$0" status
+  echo; echo "== usage-limit scan =="
+  "$0" limit-scan
+  echo
+  echo "next: pick 1-2 stale/zero-commit workspaces above and run"
+  echo "  cmuxman triage <ws>   # gather evidence + a ready metaflow prompt"
   ;;
 
 tail)
@@ -89,6 +138,37 @@ send)
 
 spawn)  exec "$BIN_DIR/cmux-spawn" "$@" ;;
 rescue) exec "$BIN_DIR/cmux-rescue" "$@" ;;
+
+goal)
+  command -v agentmaster >/dev/null || { echo "needs agentmaster on PATH (pin a goal on a fleet agent)"; exit 1; }
+  exec agentmaster goal "$@"
+  ;;
+goals)
+  command -v agentmaster >/dev/null || { echo "needs agentmaster on PATH"; exit 1; }
+  exec agentmaster goals "$@"
+  ;;
+
+triage)
+  # A stale/ambiguous workspace isn't a status question ("what does it say")
+  # but a kill-or-continue decision. cmuxman has no LLM budget of its own —
+  # it gathers the evidence and hands you a ready-to-paste metaflow prompt
+  # instead of guessing.
+  [ $# -ge 1 ] || { echo "usage: cmuxman triage <ws>"; exit 1; }
+  WS="$(ref "$1")"
+  TITLE=$(CMUX_QUIET=1 cmux workspace list 2>/dev/null | grep "$WS " | sed 's/^[^c]*cc/cc/')
+  echo "== $WS — $TITLE =="
+  echo "-- last screen --"
+  CMUX_QUIET=1 cmux read-screen --workspace "$WS" --lines 20
+  if command -v agentmaster >/dev/null 2>&1; then
+    echo "-- agentmaster peek (last user/assistant/next, zero-tax) --"
+    agentmaster peek "$WS" 2>/dev/null || echo "(no transcript found)"
+  fi
+  echo
+  echo "-- ready-to-run metaflow prompt --"
+  cat <<PROMPT
+metaflow "Diese cmux-Session ($WS: ${TITLE:-unbekannt}) hat keine echten Commits in den letzten 5 Tagen. Recherchiere kurz (Quellen), ob das Thema noch einen validen Use-Case/Markt hat oder ob es geschlossen werden sollte. Gib ein klares kill/weiter mit 72h-Testregel falls weiter."
+PROMPT
+  ;;
 
 dedupe)
   APPLY="${1:-}"
@@ -293,6 +373,203 @@ PY
   echo "scheduled: resume-fleet fires ~$FIRE (in $((DELAY/60))m via launchd timer -> ntfy -> in-cmux listener)"
   ;;
 
+optimize)
+  # Bounded recursive-learning loop, NOT unlimited autonomy: a fixed action
+  # set (resume-nudge / dedupe-close), a hard rate cap per cycle and per day,
+  # a full audit ledger (every action logged before/after, nothing silent),
+  # and a trivial kill-switch. This is the standard bounded-agent-loop shape
+  # (explicit iteration/budget cap + a metric-tied stop condition) — full
+  # autonomy still means an engineered stop contract, not none at all.
+  DB="$HOME/.config/cmuxman/optimize.db"
+  STOPFLAG="$HOME/.config/cmuxman/optimize.stop"
+  MAX_PER_CYCLE="${CMUXMAN_OPT_MAX_PER_CYCLE:-8}"
+  MAX_PER_DAY="${CMUXMAN_OPT_MAX_PER_DAY:-60}"
+  mkdir -p "$HOME/.config/cmuxman"
+  MODE="${1:-status}"
+  case "$MODE" in
+
+  --start|start)
+    EVERY="${2:-20}"
+    rm -f "$STOPFLAG"
+    TOPIC_FILE="$HOME/.config/cmuxman/remote-topic"
+    [ -s "$TOPIC_FILE" ] || { echo "needs the in-cmux listener: run  cmuxman remote-install  first"; exit 1; }
+    pgrep -f 'cmuxman remote-serve' >/dev/null || echo "WARN: no remote-serve listener running — run cmuxman remote-install"
+    PLIST="$HOME/Library/LaunchAgents/com.cmux.manager.optimize.plist"
+    cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cmux.manager.optimize</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>-c</string>
+    <string>curl -s -d "optimize cycle" https://ntfy.sh/$(cat "$TOPIC_FILE")</string>
+  </array>
+  <key>StartInterval</key><integer>$((EVERY*60))</integer>
+  <key>StandardOutPath</key><string>/tmp/cmuxman-optimize-timer.log</string>
+  <key>StandardErrorPath</key><string>/tmp/cmuxman-optimize-timer.log</string>
+</dict></plist>
+EOF
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+    echo "optimize loop started: fires every ${EVERY}m via launchd timer -> ntfy -> in-cmux listener"
+    echo "cap: ${MAX_PER_CYCLE}/cycle, ${MAX_PER_DAY}/day. stop: cmuxman optimize --stop"
+    ;;
+
+  --stop|stop)
+    touch "$STOPFLAG"
+    launchctl unload "$HOME/Library/LaunchAgents/com.cmux.manager.optimize.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.cmux.manager.optimize.plist"
+    echo "optimize loop stopped (kill-switch armed, timer removed)"
+    ;;
+
+  --status|status)
+    echo "kill-switch: $([ -f "$STOPFLAG" ] && echo ARMED || echo clear)"
+    echo "timer: $(launchctl list 2>/dev/null | grep -q com.cmux.manager.optimize && echo loaded || echo 'not loaded')"
+    [ -f "$DB" ] && python3 - "$DB" <<'PY'
+import sqlite3, sys, datetime
+db=sqlite3.connect(sys.argv[1])
+today=datetime.date.today().isoformat()
+n=db.execute("select count(*) from actions where ts like ?", (today+'%',)).fetchone()[0]
+print(f"today: {n} actions")
+print("last 10:")
+for row in db.execute("select ts,ws,action,result from actions order by ts desc limit 10"):
+    print(f"  {row[0]}  {row[1]:<14} {row[2]:<14} {row[3]}")
+PY
+    [ -f "$DB" ] || echo "no ledger yet (optimize --cycle has never run)"
+    ;;
+
+  --cycle|cycle)
+    LOG=/tmp/cmuxman-optimize.log
+    exec >>"$LOG" 2>&1
+    if [ -f "$STOPFLAG" ]; then echo "$(date '+%F %T') kill-switch armed — skipping cycle"; exit 0; fi
+    python3 - "$DB" "$MAX_PER_CYCLE" "$MAX_PER_DAY" <<'PY'
+import subprocess, json, os, re, sys, sqlite3, datetime, time
+
+db_path, max_cycle, max_day = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+env = {**os.environ, 'CMUX_QUIET': '1'}
+now = datetime.datetime.now().isoformat(timespec='seconds')
+today = now[:10]
+
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+db = sqlite3.connect(db_path)
+db.execute("""create table if not exists actions(
+    ts text, ws text, title text, action text, reason text, result text,
+    outcome text default 'pending')""")
+db.execute("""create table if not exists backoff(ws text primary key, fails int default 0, until text)""")
+db.commit()
+
+def log(msg): print(f"{now} {msg}")
+
+day_count = db.execute("select count(*) from actions where ts like ?", (today+'%',)).fetchone()[0]
+if day_count >= max_day:
+    log(f"daily cap reached ({day_count}/{max_day}) — skipping cycle")
+    sys.exit(0)
+
+# 1. Check outcomes of the previous cycle's pending actions (did status change as expected?)
+r = subprocess.run(['agentmaster', 'ls', '--json'], capture_output=True, text=True, env=env, timeout=20)
+live = {row['ref']: row for row in json.loads(r.stdout)} if r.returncode == 0 and r.stdout.strip() else {}
+
+pending = db.execute("select rowid,ws,action from actions where outcome='pending'").fetchall()
+for rowid, ws, action in pending:
+    cur = live.get(ws, {}).get('status')
+    if action == 'resume-nudge':
+        outcome = 'success' if cur in ('working', 'ready') else ('pending' if cur == 'Needs input' else 'unknown')
+    elif action == 'dedupe-close':
+        outcome = 'success' if ws not in live else 'failed'  # workspace ref gone = closed
+    else:
+        outcome = 'unknown'
+    if outcome != 'pending':
+        db.execute("update actions set outcome=? where rowid=?", (outcome, rowid))
+        if outcome == 'failed':
+            f = db.execute("select fails from backoff where ws=?", (ws,)).fetchone()
+            fails = (f[0] if f else 0) + 1
+            until = (datetime.datetime.now() + datetime.timedelta(hours=min(fails, 6))).isoformat(timespec='seconds')
+            db.execute("insert into backoff(ws,fails,until) values(?,?,?) on conflict(ws) do update set fails=?,until=?",
+                       (ws, fails, until, fails, until))
+            log(f"outcome: {ws} {action} FAILED ({fails}x) -> backing off until {until}")
+db.commit()
+
+def backed_off(ws):
+    row = db.execute("select until from backoff where ws=?", (ws,)).fetchone()
+    return bool(row and row[0] > now)
+
+# 2. Decide this cycle's actions from live fleet state (fixed action set only)
+lst = subprocess.run(['cmux', 'workspace', 'list'], capture_output=True, text=True, env=env).stdout
+title_of = dict(re.findall(r'(workspace:\d+)\s+(.*)', lst))
+
+actions = []
+for ref, row in live.items():
+    if backed_off(ref):
+        continue
+    if row.get('status') == 'Needs input':
+        scr = subprocess.run(['cmux', 'read-screen', '--workspace', ref, '--lines', '40'],
+                             capture_output=True, text=True, env=env, timeout=15).stdout
+        tail = '\n'.join([l for l in scr.splitlines() if l.strip()][-12:])
+        if re.search(r'usage limit reached|limit will reset|hit your.*limit', tail, re.I):
+            actions.append((ref, 'resume-nudge', 'usage-limit-blocked'))
+
+groups = {}
+def norm(t): return re.sub(r'[^\w\s·…-]', '', t).strip()
+for ref, title in title_of.items():
+    groups.setdefault(norm(title), []).append(ref)
+for title, refs in groups.items():
+    if len(refs) < 2:
+        continue
+    statuses = {r: live.get(r, {}).get('status') for r in refs}
+    keepable = [r for r in refs if statuses.get(r) not in ('working', 'Needs input')]
+    if len(keepable) < 2:
+        continue
+    keep = min(keepable, key=lambda r: int(r.split(':')[1]))
+    for r in keepable:
+        if r != keep and not backed_off(r):
+            actions.append((r, 'dedupe-close', f'duplicate of {keep}'))
+
+actions = actions[:max_cycle]
+if not actions:
+    log("cycle: nothing to do")
+    sys.exit(0)
+
+prompt = os.environ.get('CMUXMAN_RESUME_PROMPT', 'continue')
+did = 0
+for ws, action, reason in actions:
+    title = title_of.get(ws, '')[:50]
+    if action == 'resume-nudge':
+        s = subprocess.run(['cmux', 'send', '--workspace', ws, '--', prompt + '\\r'],
+                           capture_output=True, text=True, env=env)
+        result = 'sent' if s.returncode == 0 else f'ERR {s.stderr.strip()[:40]}'
+    elif action == 'dedupe-close':
+        s = subprocess.run(['cmux', 'workspace', 'close', ws], capture_output=True, text=True, env=env)
+        result = 'closed' if s.returncode == 0 else f'ERR {s.stderr.strip()[:40]}'
+    else:
+        result = 'skipped (unknown action)'
+    db.execute("insert into actions(ts,ws,title,action,reason,result) values(?,?,?,?,?,?)",
+              (now, ws, title, action, reason, result))
+    log(f"{action}: {ws} ({reason}) -> {result}")
+    did += 1
+    time.sleep(1.0)
+db.commit()
+
+subprocess.run(['osascript', '-e',
+    f'display notification "{did} action(s): see /tmp/cmuxman-optimize.log" with title "cmuxman optimize"'],
+    capture_output=True)
+
+# compounding memory: write a one-line fact so learned behavior survives across
+# sessions/rebuilds instead of living only in this local sqlite ledger.
+try:
+    fails_today = db.execute("select count(*) from actions where ts like ? and outcome='failed'", (today+'%',)).fetchone()[0]
+    fact = f"cmuxman optimize {today}: {did} actions this cycle, {fails_today} failed-today, backoffs active: " + \
+           ",".join(w for w, in db.execute("select ws from backoff where until>?", (now,)).fetchall())
+    subprocess.run(['bash', '-c', f'echo {json.dumps(fact)} | synx put --title "cmuxman-optimize-{today}" 2>/dev/null'],
+                  timeout=10)
+except Exception:
+    pass
+PY
+    ;;
+
+  *) echo "usage: cmuxman optimize {start [every-min]|stop|status|cycle}"; exit 1 ;;
+  esac
+  ;;
+
 remote-install)
   CFG="$HOME/.config/cmuxman"; mkdir -p "$CFG"
   TOPIC_FILE="$CFG/remote-topic"
@@ -317,7 +594,7 @@ remote-install)
 
 remote-serve)
   TOPIC=$(cat "$HOME/.config/cmuxman/remote-topic" 2>/dev/null) || { echo "run cmuxman remote-install first"; exit 1; }
-  ALLOW="status verify dedupe resume-fleet limit-scan tail send doctor snapshot version"
+  ALLOW="status verify dedupe resume-fleet limit-scan tail send doctor snapshot version optimize brief goal goals triage"
   SINCE=$(date +%s)
   echo "remote-serve listening on ntfy.sh/$TOPIC"
   while true; do
@@ -353,6 +630,9 @@ doctor)
   ok "cmux-spawn (fallback)" "$([ -x "$BIN_DIR/cmux-spawn" ] && echo ok || echo MISSING)"
   ok "ca council pool" "$(command -v ca >/dev/null && echo ok || echo 'not installed (council disabled)')"
   ok "remote listener (in cmux)" "$(pgrep -f 'cmuxman remote-serve' >/dev/null && echo running || echo 'NOT RUNNING (cmuxman remote-install)')"
+  ok "agentmaster (fleet backend)" "$(command -v agentmaster >/dev/null && agentmaster --version 2>/dev/null || echo 'not installed (weaker status fallback)')"
+  ok "optimize loop" "$(launchctl list 2>/dev/null | grep -q com.cmux.manager.optimize && echo 'loaded' || echo 'stopped')"
+  ok "optimize kill-switch" "$([ -f "$HOME/.config/cmuxman/optimize.stop" ] && echo ARMED || echo clear)"
   ;;
 
 version) echo "cmuxman $VERSION" ;;
