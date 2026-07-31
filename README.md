@@ -1,6 +1,6 @@
 # cmux-manager
 
-**Meta-orchestrator for [cmux](https://github.com/manaflow-ai/cmux) + Claude Code fleets, zero-loss app updates, usage-limit auto-resume, duplicate cleanup, a bounded recursive-learning autopilot, and phone remote control.**
+**Keeps a room full of Claude Code sessions alive inside [cmux](https://github.com/manaflow-ai/cmux).**
 
 Running a fleet of Claude Code sessions inside cmux is powerful, until an app update kills every session, the 5-hour usage limit freezes your agents mid-task, a recovery run leaves you with 11 duplicate workspaces, or half the fleet just sits idle because nobody's watching. `cmuxman` closes those gaps with one CLI, standing on [agentmaster](https://github.com/manaflow-ai) for fleet ground-truth rather than re-guessing it.
 
