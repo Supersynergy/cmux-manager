@@ -1,6 +1,6 @@
 # cmux-manager
 
-![Abstract terminal workspace with coordinated agents](assets/cover.png)
+![cmux Manager](assets/cover.png)
 
 [Install](#install) · [How it works](#why-it-works-when-naive-approaches-fail) · [Commands](#commands) · [Safety](#safety-model) · [License](#license)
 
