@@ -1,6 +1,9 @@
+<p align="center">
+  <img src="assets/cover.png" alt="cmux Manager" width="960">
+</p>
+
 # cmux-manager
 
-![cmux Manager](assets/cover.png)
 
 [Install](#install) · [How it works](#why-it-works-when-naive-approaches-fail) · [Commands](#commands) · [Safety](#safety-model) · [License](#license)
 
